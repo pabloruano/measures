@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Floor Plan Measurement Tool</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+    }
+    #canvas-container {
+      position: relative;
+      display: inline-block;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    #myCanvas {
+      cursor: crosshair;
+    }
+    #controls, #info, #objectControls, #projectControls {
+      margin-top: 10px;
+    }
+    #controls button, #projectControls button {
+      margin-right: 8px;
+    }
+    .object-item {
+      margin-bottom: 5px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Floor Plan Measurement Tool</h1>
+
+  <!-- 1. Upload Floor Plan -->
+  <div>
+    <label for="floorPlanInput">Upload Floor Plan Image:</label>
+    <input type="file" id="floorPlanInput" accept="image/*" />
+  </div>
+
+  <!-- 2. Canvas and Container -->
+  <div id="canvas-container">
+    <canvas id="myCanvas"></canvas>
+  </div>
+
+  <!-- 3. Controls for Scale, Mode, and Measurement -->
+  <div id="controls">
+    <label>Known Distance (in meters): 
+      <input type="number" id="knownDistance" value="1" step="0.1" />
+    </label>
+    <button id="setScaleBtn">Set Scale</button>
+    <button id="resetBtn">Reset Points</button>
+    <button id="undoBtn">Undo Last Point</button>
+    <br><br>
+    <label for="modeSelector">Mode: </label>
+    <select id="modeSelector">
+      <option value="polygon" selected>Polygon</option>
+      <option value="segment">Segment</option>
+      <option value="rectangle">Rectangle</option>
+      <option value="text">Text</option>
+    </select>
+    <!-- Finish button is used only in polygon mode -->
+    <button id="finishPolygonBtn">Finish Polygon</button>
+    <p><small>Tip: Hold shift when clicking (or moving) to snap the line to a 45° angle.</small></p>
+  </div>
+
+  <!-- 4. Info output -->
+  <div id="info"></div>
+
+  <!-- 5. Object management (list drawn polygons, segments, rectangles & texts) -->
+  <div id="objectControls">
+    <h3>Drawn Objects</h3>
+    <ul id="objectsList"></ul>
+  </div>
+
+  <!-- 6. Project Management -->
+  <div id="projectControls">
+    <h3>Project Management</h3>
+    <button id="saveProjectBtn">Save Project</button>
+    <button id="loadProjectBtn">Load Project</button>
+    <input type="file" id="loadProjectInput" accept=".json" style="display:none" />
+  </div>
+
+  <script>
+    // Get DOM elements
+    const fileInput = document.getElementById('floorPlanInput');
+    const canvas = document.getElementById('myCanvas');
+    const ctx = canvas.getContext('2d');
+    const knownDistanceInput = document.getElementById('knownDistance');
+    const setScaleBtn = document.getElementById('setScaleBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const undoBtn = document.getElementById('undoBtn');
+    const finishPolygonBtn = document.getElementById('finishPolygonBtn');
+    const modeSelector = document.getElementById('modeSelector');
+    const infoDiv = document.getElementById('info');
+    const objectsList = document.getElementById('objectsList');
+    const saveProjectBtn = document.getElementById('saveProjectBtn');
+    const loadProjectBtn = document.getElementById('loadProjectBtn');
+    const loadProjectInput = document.getElementById('loadProjectInput');
+
+    // Global variables
+    let floorPlanImage = null;
+    let scale = 1;         // meters per pixel
+    let isScaleSet = false;
+    let currentMode = modeSelector.value; // "polygon", "segment", "rectangle", or "text"
+
+    // Arrays for calibration, active drawing, and finalized objects.
+    let calibrationPoints = [];
+    let measurementPoints = []; // used while drawing a new object
+    let polygons = []; // Each polygon: { points: [...], color: "blue" }
+    let segments = []; // Each segment: { points: [p1, p2], color: "red" }
+    let rectangles = []; // Each rectangle: { points: [A, B, C, D], color: "purple" }
+    let texts = []; // Each text: { x, y, text, color, fontSize, fontFamily }
+
+    // Default colors and font settings
+    const defaultPolygonColor = "blue";
+    const defaultSegmentColor = "red";
+    const defaultRectangleColor = "purple";
+    const defaultTextColor = "black";
+    const defaultTextSize = 16;
+    const defaultTextFamily = "sans-serif";
+
+    // Update current drawing mode when the user changes it.
+    modeSelector.addEventListener('change', (e) => {
+      currentMode = e.target.value;
+      // Clear any in-progress drawing when switching mode.
+      measurementPoints = [];
+      previewPoint = null;
+      drawAll();
+      displayCurrentMeasurements();
+    });
+
+    // --- Load Image ---
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        floorPlanImage = new Image();
+        floorPlanImage.onload = function() {
+          canvas.width = floorPlanImage.width;
+          canvas.height = floorPlanImage.height;
+          drawAll();
+        };
+        floorPlanImage.src = evt.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // --- Canvas Click Handler ---
+    canvas.addEventListener('click', (e) => {
+      if (!floorPlanImage) {
+        alert("Please upload a floor plan image first.");
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      let x = e.clientX - rect.left;
+      let y = e.clientY - rect.top;
+
+      // If shift is pressed, snap the new point as in mousemove.
+      if (e.shiftKey && measurementPoints.length > 0) {
+        const lastPt = measurementPoints[measurementPoints.length - 1];
+        let dx = x - lastPt.x;
+        let dy = y - lastPt.y;
+        let angle = Math.atan2(dy, dx);
+        let snappedAngle = Math.round(angle / (Math.PI / 4)) * (Math.PI / 4);
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        x = lastPt.x + dist * Math.cos(snappedAngle);
+        y = lastPt.y + dist * Math.sin(snappedAngle);
+      }
+
+      // If scale is not set, we are in calibration mode.
+      if (!isScaleSet) {
+        calibrationPoints.push({ x, y });
+        if (calibrationPoints.length === 2) {
+          infoDiv.innerHTML = `<p>Calibration points set. Enter the real distance and click "Set Scale".</p>`;
+        }
+        drawAll();
+        return;
+      }
+
+      // --- Handle Text Mode ---
+      if (currentMode === "text") {
+        let userText = prompt("Enter text:");
+        if (userText) {
+          texts.push({ x, y, text: userText, color: defaultTextColor, fontSize: defaultTextSize, fontFamily: defaultTextFamily });
+          updateObjectsList();
+          drawAll();
+        }
+        return;
+      }
+
+      // --- Handle Rectangle Mode ---
+      if (currentMode === "rectangle") {
+        if (measurementPoints.length < 2) {
+          // First two clicks define the base segment.
+          measurementPoints.push({ x, y });
+          drawAll();
+        } else if (measurementPoints.length === 2) {
+          // Third click finalizes the rectangle.
+          const rectPoints = computeRectanglePoints(measurementPoints[0], measurementPoints[1], {x, y});
+          if (rectPoints) {
+            rectangles.push({ points: rectPoints, color: defaultRectangleColor });
+          }
+          measurementPoints = [];
+          previewPoint = null;
+          updateObjectsList();
+          drawAll();
+        }
+        displayCurrentMeasurements();
+        return;
+      }
+
+      // --- Handle Polygon & Segment Modes ---
+      measurementPoints.push({ x, y });
+      if (currentMode === "segment") {
+        // In segment mode, once we have 2 points, finalize the segment.
+        if (measurementPoints.length === 2) {
+          segments.push({ points: [...measurementPoints], color: defaultSegmentColor });
+          measurementPoints = [];
+          previewPoint = null;
+          updateObjectsList();
+        }
+      }
+      drawAll();
+      displayCurrentMeasurements();
+    });
+
+    // --- Canvas Mousemove Handler for Preview ---
+    canvas.addEventListener('mousemove', (e) => {
+      if (!isScaleSet) {
+        previewPoint = null;
+        drawAll();
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      let x = e.clientX - rect.left;
+      let y = e.clientY - rect.top;
+      
+      if (e.shiftKey && measurementPoints.length > 0) {
+        const lastPt = measurementPoints[measurementPoints.length - 1];
+        let dx = x - lastPt.x;
+        let dy = y - lastPt.y;
+        let angle = Math.atan2(dy, dx);
+        let snappedAngle = Math.round(angle / (Math.PI / 4)) * (Math.PI / 4);
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        x = lastPt.x + dist * Math.cos(snappedAngle);
+        y = lastPt.y + dist * Math.sin(snappedAngle);
+      }
+      
+      // For rectangle mode, only show preview after base is defined (2 points).
+      if (currentMode === "rectangle" && measurementPoints.length === 2) {
+        previewPoint = { x, y };
+      } else if (measurementPoints.length > 0 && currentMode !== "rectangle") {
+        previewPoint = { x, y };
+      } else {
+        previewPoint = null;
+      }
+      drawAll();
+    });
+
+    // --- Set Scale Button ---
+    setScaleBtn.addEventListener('click', () => {
+      if (calibrationPoints.length < 2) {
+        alert("Please click two points on the canvas for calibration first.");
+        return;
+      }
+      const knownDist = parseFloat(knownDistanceInput.value) || 1;
+      const distPx = distanceBetween(calibrationPoints[0], calibrationPoints[1]);
+      if (distPx === 0) {
+        alert("Invalid calibration points. Choose two distinct points.");
+        return;
+      }
+      scale = knownDist / distPx;
+      isScaleSet = true;
+      infoDiv.innerHTML = `<p>Scale has been set! (1 pixel = ${scale.toFixed(4)} m)</p>
+                           <p>Current mode: ${currentMode}. Use the canvas to draw.</p>`;
+      drawAll();
+    });
+
+    // --- Reset Button ---
+    resetBtn.addEventListener('click', () => {
+      calibrationPoints = [];
+      measurementPoints = [];
+      polygons = [];
+      segments = [];
+      rectangles = [];
+      texts = [];
+      previewPoint = null;
+      isScaleSet = false;
+      scale = 1;
+      updateObjectsList();
+      infoDiv.innerHTML = "<p>Reset completed.</p>";
+      if (floorPlanImage) {
+        ctx.drawImage(floorPlanImage, 0, 0);
+      }
+    });
+
+    // --- Undo Button (active drawing) ---
+    undoBtn.addEventListener('click', () => {
+      if (!isScaleSet) {
+        calibrationPoints.pop();
+      } else {
+        measurementPoints.pop();
+      }
+      previewPoint = null;
+      drawAll();
+      displayCurrentMeasurements();
+    });
+
+    // --- Finish Polygon Button (only in polygon mode) ---
+    finishPolygonBtn.addEventListener('click', () => {
+      if (currentMode !== "polygon") {
+        alert("Finish Polygon is only available in polygon mode.");
+        return;
+      }
+      if (!isScaleSet || measurementPoints.length < 3) {
+        alert("You need at least 3 points to form a polygon. Make sure scale is set.");
+        return;
+      }
+      polygons.push({ points: [...measurementPoints], color: defaultPolygonColor });
+      measurementPoints = [];
+      previewPoint = null;
+      updateObjectsList();
+      drawAll();
+      displayCurrentMeasurements();
+    });
+
+    // --- Project Save/Load ---
+    saveProjectBtn.addEventListener('click', () => {
+      const project = {
+        calibrationPoints,
+        isScaleSet,
+        scale,
+        floorPlanImageSrc: floorPlanImage ? floorPlanImage.src : null,
+        polygons,
+        segments,
+        rectangles,
+        texts
+      };
+      const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(project));
+      const downloadAnchor = document.createElement('a');
+      downloadAnchor.setAttribute("href", dataStr);
+      downloadAnchor.setAttribute("download", "floor_plan_project.json");
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+      downloadAnchor.remove();
+    });
+
+    loadProjectBtn.addEventListener('click', () => {
+      loadProjectInput.click();
+    });
+
+    loadProjectInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        const project = JSON.parse(evt.target.result);
+        calibrationPoints = project.calibrationPoints || [];
+        isScaleSet = project.isScaleSet || false;
+        scale = project.scale || 1;
+        polygons = project.polygons || [];
+        segments = project.segments || [];
+        rectangles = project.rectangles || [];
+        texts = project.texts || [];
+        if (project.floorPlanImageSrc) {
+          floorPlanImage = new Image();
+          floorPlanImage.onload = function() {
+            canvas.width = floorPlanImage.width;
+            canvas.height = floorPlanImage.height;
+            drawAll();
+          };
+          floorPlanImage.src = project.floorPlanImageSrc;
+        }
+        updateObjectsList();
+        drawAll();
+      };
+      reader.readAsText(file);
+    });
+
+    // --- Helper Functions ---
+    function distanceBetween(p1, p2) {
+      return Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+    }
+
+    function polygonAreaPx(points) {
+      let area = 0;
+      for (let i = 0; i < points.length; i++) {
+        const j = (i + 1) % points.length;
+        area += points[i].x * points[j].y - points[j].x * points[i].y;
+      }
+      return Math.abs(area) / 2;
+    }
+
+    function polygonCentroid(points) {
+      let x = 0, y = 0, signedArea = 0;
+      for (let i = 0; i < points.length; i++) {
+        const j = (i + 1) % points.length;
+        const cross = points[i].x * points[j].y - points[j].x * points[i].y;
+        x += (points[i].x + points[j].x) * cross;
+        y += (points[i].y + points[j].y) * cross;
+        signedArea += cross;
+      }
+      signedArea *= 0.5;
+      if (signedArea === 0) return { x: points[0].x, y: points[0].y };
+      x = x / (6 * signedArea);
+      y = y / (6 * signedArea);
+      return { x, y };
+    }
+
+    function computeRectanglePoints(A, B, P) {
+      const AB = { x: B.x - A.x, y: B.y - A.y };
+      const baseLength = Math.sqrt(AB.x * AB.x + AB.y * AB.y);
+      if (baseLength === 0) return null;
+      const perp = { x: -AB.y, y: AB.x };
+      const perpLength = Math.sqrt(perp.x * perp.x + perp.y * perp.y);
+      const unitPerp = { x: perp.x / perpLength, y: perp.y / perpLength };
+      const AP = { x: P.x - A.x, y: P.y - A.y };
+      const height = AP.x * unitPerp.x + AP.y * unitPerp.y;
+      const offset = { x: height * unitPerp.x, y: height * unitPerp.y };
+      const C = { x: B.x + offset.x, y: B.y + offset.y };
+      const D = { x: A.x + offset.x, y: A.y + offset.y };
+      return [A, B, C, D];
+    }
+
+    // --- Drawing Functions ---
+    function drawAll() {
+      if (!floorPlanImage) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(floorPlanImage, 0, 0);
+
+      // Calibration points and line
+      calibrationPoints.forEach(pt => drawPoint(pt.x, pt.y, "green"));
+      if (calibrationPoints.length === 2) {
+        ctx.strokeStyle = "green";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(calibrationPoints[0].x, calibrationPoints[0].y);
+        ctx.lineTo(calibrationPoints[1].x, calibrationPoints[1].y);
+        ctx.stroke();
+        drawSegmentLabel(calibrationPoints[0], calibrationPoints[1], "green");
+      }
+
+      // Draw polygons
+      polygons.forEach(poly => {
+        drawPolygon(poly.points, poly.color, false);
+        drawPolygonAreaLabel(poly.points, poly.color);
+      });
+
+      // Draw segments
+      segments.forEach(seg => {
+        const pts = seg.points;
+        ctx.strokeStyle = seg.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        ctx.lineTo(pts[1].x, pts[1].y);
+        ctx.stroke();
+        drawSegmentLabel(pts[0], pts[1], seg.color);
+        pts.forEach(pt => drawPoint(pt.x, pt.y, seg.color));
+      });
+
+      // Draw rectangles
+      rectangles.forEach(rect => {
+        drawPolygon(rect.points, rect.color, false);
+        drawPolygonAreaLabel(rect.points, rect.color);
+      });
+
+      // Draw text objects
+      texts.forEach(txt => {
+        ctx.font = `${txt.fontSize}px ${txt.fontFamily}`;
+        ctx.fillStyle = txt.color;
+        ctx.fillText(txt.text, txt.x, txt.y);
+      });
+
+      // Draw active measurement
+      if (measurementPoints.length > 0) {
+        if (currentMode === "polygon") {
+          if (measurementPoints.length >= 2) {
+            drawPolygon(measurementPoints, "red", true);
+            drawActiveSegmentLabels(measurementPoints);
+          } else {
+            drawPoint(measurementPoints[0].x, measurementPoints[0].y, "red");
+          }
+        }
+        if (currentMode === "segment" && measurementPoints.length === 1) {
+          drawPoint(measurementPoints[0].x, measurementPoints[0].y, "red");
+        }
+        if (currentMode === "rectangle") {
+          if (measurementPoints.length === 2 && previewPoint) {
+            const rectPoints = computeRectanglePoints(measurementPoints[0], measurementPoints[1], previewPoint);
+            if (rectPoints) {
+              ctx.save();
+              ctx.setLineDash([5, 5]);
+              ctx.strokeStyle = defaultRectangleColor;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(rectPoints[0].x, rectPoints[0].y);
+              for (let i = 1; i < rectPoints.length; i++) {
+                ctx.lineTo(rectPoints[i].x, rectPoints[i].y);
+              }
+              ctx.closePath();
+              ctx.stroke();
+              ctx.restore();
+              rectPoints.forEach(pt => drawPoint(pt.x, pt.y, defaultRectangleColor));
+              const baseL = distanceBetween(measurementPoints[0], measurementPoints[1]);
+              const AB = { x: measurementPoints[1].x - measurementPoints[0].x, y: measurementPoints[1].y - measurementPoints[0].y };
+              let height = 0;
+              if (baseL !== 0) {
+                const perp = { x: -AB.y, y: AB.x };
+                const perpLen = Math.sqrt(perp.x * perp.x + perp.y * perp.y);
+                const unitPerp = { x: perp.x / perpLen, y: perp.y / perpLen };
+                const AP = { x: previewPoint.x - measurementPoints[0].x, y: previewPoint.y - measurementPoints[0].y };
+                height = Math.abs(AP.x * unitPerp.x + AP.y * unitPerp.y);
+              }
+              const areaPx = baseL * height;
+              const areaM2 = areaPx * scale * scale;
+              const centroid = { 
+                x: (rectPoints[0].x + rectPoints[1].x + rectPoints[2].x + rectPoints[3].x) / 4, 
+                y: (rectPoints[0].y + rectPoints[1].y + rectPoints[2].y + rectPoints[3].y) / 4 
+              };
+              ctx.font = "16px sans-serif";
+              ctx.fillStyle = defaultRectangleColor;
+              ctx.fillText(areaM2.toFixed(2) + " m²", centroid.x, centroid.y);
+            }
+          } else if (measurementPoints.length === 1) {
+            drawPoint(measurementPoints[0].x, measurementPoints[0].y, defaultRectangleColor);
+          }
+        }
+      }
+      
+      // Draw preview stepped line for polygon & segment modes
+      if (previewPoint && measurementPoints.length > 0 && currentMode !== "rectangle") {
+        const lastPt = measurementPoints[measurementPoints.length - 1];
+        drawSteppedPreviewLine(lastPt, previewPoint, "red");
+      }
+    }
+
+    function drawPoint(x, y, color = "red") {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+
+    function drawPolygon(points, color = "red", isOpen = false) {
+      if (points.length < 2) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      if (!isOpen) ctx.closePath();
+      ctx.stroke();
+      points.forEach(pt => drawPoint(pt.x, pt.y, color));
+    }
+
+    function drawSegmentLabel(p1, p2, color) {
+      const midX = (p1.x + p2.x) / 2;
+      const midY = (p1.y + p2.y) / 2;
+      const distPx = distanceBetween(p1, p2);
+      const distM = distPx * scale;
+      const label = distM.toFixed(2) + " m";
+      ctx.font = "14px sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(label, midX + 5, midY - 5);
+    }
+
+    function drawActiveSegmentLabels(points) {
+      for (let i = 0; i < points.length - 1; i++) {
+        drawSegmentLabel(points[i], points[i + 1], "red");
+      }
+    }
+
+    function drawPolygonAreaLabel(points, color) {
+      const areaPx2 = polygonAreaPx(points);
+      const areaM2 = areaPx2 * scale * scale;
+      const centroid = polygonCentroid(points);
+      const label = areaM2.toFixed(2) + " m²";
+      ctx.font = "16px sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(label, centroid.x, centroid.y);
+    }
+
+    function drawSteppedPreviewLine(p1, p2, color) {
+      const intermediate = { x: p2.x, y: p1.y };
+      ctx.save();
+      ctx.setLineDash([5, 5]);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(intermediate.x, intermediate.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+      ctx.restore();
+
+      const dx = Math.abs(p2.x - p1.x);
+      const dy = Math.abs(p2.y - p1.y);
+      const manhattanDistance = dx + dy;
+      const distanceMeters = manhattanDistance * scale;
+      const label = distanceMeters.toFixed(2) + " m";
+
+      const total = dx + dy;
+      let midPoint = { x: 0, y: 0 };
+      if (total === 0) {
+        midPoint = { x: p1.x, y: p1.y };
+      } else if (dx >= total / 2) {
+        const ratio = (total / 2) / dx;
+        midPoint.x = p1.x + (p2.x - p1.x) * ratio;
+        midPoint.y = p1.y;
+      } else {
+        const remainder = total / 2 - dx;
+        const d2 = dy;
+        const ratio = d2 === 0 ? 0 : remainder / d2;
+        midPoint.x = p2.x;
+        midPoint.y = p1.y + (p2.y - p1.y) * ratio;
+      }
+      ctx.font = "14px sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(label, midPoint.x + 5, midPoint.y - 5);
+    }
+
+    function displayCurrentMeasurements() {
+      if (!isScaleSet) {
+        infoDiv.innerHTML = "<p>Scale not set yet.</p>";
+        return;
+      }
+      let text = "";
+      if (currentMode === "polygon" && measurementPoints.length >= 2) {
+        const lastIndex = measurementPoints.length - 1;
+        const distPx = distanceBetween(measurementPoints[lastIndex - 1], measurementPoints[lastIndex]);
+        const distM = distPx * scale;
+        text += `<p>Last fixed segment distance: ${distM.toFixed(2)} m</p>`;
+        if (measurementPoints.length >= 3) {
+          const areaPx2 = polygonAreaPx(measurementPoints);
+          const areaM2 = areaPx2 * scale * scale;
+          text += `<p>Current polygon area: ${areaM2.toFixed(2)} m²</p>`;
+        }
+      }
+      if (currentMode === "rectangle") {
+        if (measurementPoints.length === 1) {
+          text += `<p>Base start point set.</p>`;
+        }
+        if (measurementPoints.length === 2 && previewPoint) {
+          const AB = { x: measurementPoints[1].x - measurementPoints[0].x, y: measurementPoints[1].y - measurementPoints[0].y };
+          const baseL = distanceBetween(measurementPoints[0], measurementPoints[1]);
+          let height = 0;
+          if (baseL !== 0) {
+            const perp = { x: -AB.y, y: AB.x };
+            const perpLen = Math.sqrt(perp.x * perp.x + perp.y * perp.y);
+            const unitPerp = { x: perp.x / perpLen, y: perp.y / perpLen };
+            const AP = { x: previewPoint.x - measurementPoints[0].x, y: previewPoint.y - measurementPoints[0].y };
+            height = Math.abs(AP.x * unitPerp.x + AP.y * unitPerp.y);
+          }
+          const areaPx = baseL * height;
+          const areaM2 = areaPx * scale * scale;
+          text += `<p>Current rectangle area: ${areaM2.toFixed(2)} m²</p>`;
+        }
+      }
+      infoDiv.innerHTML = text || "<p>No active measurements.</p>";
+    }
+
+    // --- Object Management UI ---
+    function updateObjectsList() {
+      objectsList.innerHTML = "";
+      // List polygons.
+      polygons.forEach((poly, index) => {
+        const li = document.createElement('li');
+        li.className = "object-item";
+        li.innerHTML = `Polygon ${index+1} - Color: <input type="color" value="${poly.color}" data-type="polygon" data-index="${index}"> 
+                        <button data-type="polygon" data-index="${index}">Delete</button>`;
+        objectsList.appendChild(li);
+      });
+      // List segments.
+      segments.forEach((seg, index) => {
+        const li = document.createElement('li');
+        li.className = "object-item";
+        li.innerHTML = `Segment ${index+1} - Color: <input type="color" value="${seg.color}" data-type="segment" data-index="${index}"> 
+                        <button data-type="segment" data-index="${index}">Delete</button>`;
+        objectsList.appendChild(li);
+      });
+      // List rectangles.
+      rectangles.forEach((rect, index) => {
+        const li = document.createElement('li');
+        li.className = "object-item";
+        li.innerHTML = `Rectangle ${index+1} - Color: <input type="color" value="${rect.color}" data-type="rectangle" data-index="${index}"> 
+                        <button data-type="rectangle" data-index="${index}">Delete</button>`;
+        objectsList.appendChild(li);
+      });
+      // List text objects.
+      texts.forEach((txt, index) => {
+        const li = document.createElement('li');
+        li.className = "object-item";
+        li.innerHTML = `Text ${index+1} - Content: <input type="text" value="${txt.text}" data-type="text-content" data-index="${index}"> 
+                        Color: <input type="color" value="${txt.color}" data-type="text" data-index="${index}"> 
+                        Font size: <input type="number" value="${txt.fontSize}" data-type="text-size" data-index="${index}" style="width: 50px;"> 
+                        <button data-type="text" data-index="${index}">Delete</button>`;
+        objectsList.appendChild(li);
+      });
+      
+      // Attach listeners for color changes (for polygons, segments, rectangles, and text color).
+      const colorInputs = objectsList.querySelectorAll('input[type="color"]');
+      colorInputs.forEach(input => {
+        input.addEventListener('change', (e) => {
+          const type = e.target.getAttribute('data-type');
+          const idx = parseInt(e.target.getAttribute('data-index'));
+          if (type === "polygon") {
+            polygons[idx].color = e.target.value;
+          } else if (type === "segment") {
+            segments[idx].color = e.target.value;
+          } else if (type === "rectangle") {
+            rectangles[idx].color = e.target.value;
+          } else if (type === "text") {
+            texts[idx].color = e.target.value;
+          }
+          drawAll();
+        });
+      });
+      // Attach listeners for delete buttons.
+      const buttons = objectsList.querySelectorAll('button');
+      buttons.forEach(button => {
+        button.addEventListener('click', (e) => {
+          const type = e.target.getAttribute('data-type');
+          const idx = parseInt(e.target.getAttribute('data-index'));
+          if (type === "polygon") {
+            polygons.splice(idx, 1);
+          } else if (type === "segment") {
+            segments.splice(idx, 1);
+          } else if (type === "rectangle") {
+            rectangles.splice(idx, 1);
+          } else if (type === "text") {
+            texts.splice(idx, 1);
+          }
+          updateObjectsList();
+          drawAll();
+        });
+      });
+      // Attach listeners for text content and font size changes.
+      const textContentInputs = objectsList.querySelectorAll('input[data-type="text-content"]');
+      textContentInputs.forEach(input => {
+        input.addEventListener('change', (e) => {
+          const idx = parseInt(e.target.getAttribute('data-index'));
+          texts[idx].text = e.target.value;
+          drawAll();
+        });
+      });
+      const textSizeInputs = objectsList.querySelectorAll('input[data-type="text-size"]');
+      textSizeInputs.forEach(input => {
+        input.addEventListener('change', (e) => {
+          const idx = parseInt(e.target.getAttribute('data-index'));
+          texts[idx].fontSize = parseInt(e.target.value);
+          drawAll();
+        });
+      });
+    }
+  </script>
+</body>
+</html>
