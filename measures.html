@@ -26,6 +26,10 @@
     .object-item {
       margin-bottom: 5px;
     }
+    /* Highlight selected item from the list when an element on the canvas is double clicked */
+    .object-item.selected {
+      background-color: #ffffcc;
+    }
   </style>
 </head>
 <body>
@@ -81,6 +85,16 @@
   </div>
 
   <script>
+    /*
+     * Floor Plan Measurement Tool
+     * ---------------------------
+     * This application lets the user load an image (e.g. a floor plan) and draw
+     * measurements on top of it.  The user can draw polygons, segments, rectangles
+     * or place text annotations.  Each object can have its color changed and can
+     * be saved/loaded as part of a project.  Lengths and areas are shown directly
+     * on the canvas according to the calibrated scale.
+     */
+
     // Get DOM elements
     const fileInput = document.getElementById('floorPlanInput');
     const canvas = document.getElementById('myCanvas');
@@ -106,10 +120,15 @@
     // Arrays for calibration, active drawing, and finalized objects.
     let calibrationPoints = [];
     let measurementPoints = []; // used while drawing a new object
-    let polygons = []; // Each polygon: { points: [...], color: "blue" }
-    let segments = []; // Each segment: { points: [p1, p2], color: "red" }
-    let rectangles = []; // Each rectangle: { points: [A, B, C, D], color: "purple" }
+    let polygons = []; // Each polygon: { points: [...], color, showArea }
+    let segments = []; // Each segment: { points: [p1, p2], color, showLength }
+    let rectangles = []; // Each rectangle: { points: [A, B, C, D], color, showArea }
     let texts = []; // Each text: { x, y, text, color, fontSize, fontFamily }
+
+    // Preview point during drawing, selected list item and dirty flag
+    let previewPoint = null;
+    let selectedObject = null; // {type, index}
+    let projectDirty = false;
 
     // Default colors and font settings
     const defaultPolygonColor = "blue";
@@ -118,6 +137,19 @@
     const defaultTextColor = "black";
     const defaultTextSize = 16;
     const defaultTextFamily = "sans-serif";
+
+    // Mark the project as dirty whenever modifications happen
+    function markDirty() {
+      projectDirty = true;
+    }
+
+    // Warn the user about unsaved changes when leaving the page
+    window.addEventListener('beforeunload', (e) => {
+      if (projectDirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
 
     // Update current drawing mode when the user changes it.
     modeSelector.addEventListener('change', (e) => {
@@ -183,6 +215,7 @@
         let userText = prompt("Enter text:");
         if (userText) {
           texts.push({ x, y, text: userText, color: defaultTextColor, fontSize: defaultTextSize, fontFamily: defaultTextFamily });
+          markDirty();
           updateObjectsList();
           drawAll();
         }
@@ -199,7 +232,8 @@
           // Third click finalizes the rectangle.
           const rectPoints = computeRectanglePoints(measurementPoints[0], measurementPoints[1], {x, y});
           if (rectPoints) {
-            rectangles.push({ points: rectPoints, color: defaultRectangleColor });
+            rectangles.push({ points: rectPoints, color: defaultRectangleColor, showArea: true });
+            markDirty();
           }
           measurementPoints = [];
           previewPoint = null;
@@ -215,7 +249,8 @@
       if (currentMode === "segment") {
         // In segment mode, once we have 2 points, finalize the segment.
         if (measurementPoints.length === 2) {
-          segments.push({ points: [...measurementPoints], color: defaultSegmentColor });
+          segments.push({ points: [...measurementPoints], color: defaultSegmentColor, showLength: true });
+          markDirty();
           measurementPoints = [];
           previewPoint = null;
           updateObjectsList();
@@ -223,6 +258,19 @@
       }
       drawAll();
       displayCurrentMeasurements();
+    });
+
+    // When an existing element on the canvas is double-clicked, scroll to its
+    // entry in the objects list so the user can edit its properties.
+    canvas.addEventListener('dblclick', (e) => {
+      if (!isScaleSet) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const obj = getObjectAt(x, y);
+      if (obj) {
+        highlightObject(obj.type, obj.index);
+      }
     });
 
     // --- Canvas Mousemove Handler for Preview ---
@@ -274,6 +322,7 @@
       isScaleSet = true;
       infoDiv.innerHTML = `<p>Scale has been set! (1 pixel = ${scale.toFixed(4)} m)</p>
                            <p>Current mode: ${currentMode}. Use the canvas to draw.</p>`;
+      markDirty();
       drawAll();
     });
 
@@ -293,6 +342,7 @@
       if (floorPlanImage) {
         ctx.drawImage(floorPlanImage, 0, 0);
       }
+      markDirty();
     });
 
     // --- Undo Button (active drawing) ---
@@ -305,6 +355,7 @@
       previewPoint = null;
       drawAll();
       displayCurrentMeasurements();
+      markDirty();
     });
 
     // --- Finish Polygon Button (only in polygon mode) ---
@@ -317,7 +368,8 @@
         alert("You need at least 3 points to form a polygon. Make sure scale is set.");
         return;
       }
-      polygons.push({ points: [...measurementPoints], color: defaultPolygonColor });
+      polygons.push({ points: [...measurementPoints], color: defaultPolygonColor, showArea: true });
+      markDirty();
       measurementPoints = [];
       previewPoint = null;
       updateObjectsList();
@@ -344,6 +396,7 @@
       document.body.appendChild(downloadAnchor);
       downloadAnchor.click();
       downloadAnchor.remove();
+      projectDirty = false;
     });
 
     loadProjectBtn.addEventListener('click', () => {
@@ -359,9 +412,21 @@
         calibrationPoints = project.calibrationPoints || [];
         isScaleSet = project.isScaleSet || false;
         scale = project.scale || 1;
-        polygons = project.polygons || [];
-        segments = project.segments || [];
-        rectangles = project.rectangles || [];
+        polygons = (project.polygons || []).map(p => ({
+          points: p.points,
+          color: p.color || defaultPolygonColor,
+          showArea: p.showArea !== false
+        }));
+        segments = (project.segments || []).map(s => ({
+          points: s.points,
+          color: s.color || defaultSegmentColor,
+          showLength: s.showLength !== false
+        }));
+        rectangles = (project.rectangles || []).map(r => ({
+          points: r.points,
+          color: r.color || defaultRectangleColor,
+          showArea: r.showArea !== false
+        }));
         texts = project.texts || [];
         if (project.floorPlanImageSrc) {
           floorPlanImage = new Image();
@@ -374,6 +439,7 @@
         }
         updateObjectsList();
         drawAll();
+        projectDirty = false;
       };
       reader.readAsText(file);
     });
@@ -423,6 +489,49 @@
       return [A, B, C, D];
     }
 
+    function pointInPolygon(pt, verts) {
+      let inside = false;
+      for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+        const xi = verts[i].x, yi = verts[i].y;
+        const xj = verts[j].x, yj = verts[j].y;
+        const intersect = ((yi > pt.y) !== (yj > pt.y)) &&
+                          (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+  function distanceToSegment(pt, v, w) {
+    const l2 = (v.x-w.x)*(v.x-w.x)+(v.y-w.y)*(v.y-w.y);
+    if (l2 === 0) return Math.sqrt((pt.x-v.x)**2 + (pt.y-v.y)**2);
+    let t = ((pt.x-v.x)*(w.x-v.x)+(pt.y-v.y)*(w.y-v.y))/l2;
+    t = Math.max(0, Math.min(1, t));
+    const proj = { x: v.x + t*(w.x-v.x), y: v.y + t*(w.y-v.y) };
+    return Math.sqrt((pt.x-proj.x)**2 + (pt.y-proj.y)**2);
+  }
+
+  // Determine which drawn object (if any) is located at the given canvas
+  // coordinates. Used when the user double clicks the canvas.
+  function getObjectAt(x, y) {
+      const pt = {x, y};
+      for (let i = polygons.length - 1; i >= 0; i--) {
+        if (pointInPolygon(pt, polygons[i].points)) return {type:'polygon', index:i};
+      }
+      for (let i = rectangles.length - 1; i >= 0; i--) {
+        if (pointInPolygon(pt, rectangles[i].points)) return {type:'rectangle', index:i};
+      }
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (distanceToSegment(pt, segments[i].points[0], segments[i].points[1]) < 6) return {type:'segment', index:i};
+      }
+      for (let i = texts.length - 1; i >= 0; i--) {
+        ctx.font = `${texts[i].fontSize}px ${texts[i].fontFamily}`;
+        const width = ctx.measureText(texts[i].text).width;
+        const height = texts[i].fontSize;
+        if (x >= texts[i].x && x <= texts[i].x + width && y <= texts[i].y && y >= texts[i].y - height) return {type:'text', index:i};
+      }
+      return null;
+    }
+
     // --- Drawing Functions ---
     function drawAll() {
       if (!floorPlanImage) return;
@@ -444,7 +553,9 @@
       // Draw polygons
       polygons.forEach(poly => {
         drawPolygon(poly.points, poly.color, false);
-        drawPolygonAreaLabel(poly.points, poly.color);
+        if (poly.showArea !== false) {
+          drawPolygonAreaLabel(poly.points, poly.color);
+        }
       });
 
       // Draw segments
@@ -456,14 +567,18 @@
         ctx.moveTo(pts[0].x, pts[0].y);
         ctx.lineTo(pts[1].x, pts[1].y);
         ctx.stroke();
-        drawSegmentLabel(pts[0], pts[1], seg.color);
+        if (seg.showLength !== false) {
+          drawSegmentLabel(pts[0], pts[1], seg.color);
+        }
         pts.forEach(pt => drawPoint(pt.x, pt.y, seg.color));
       });
 
       // Draw rectangles
       rectangles.forEach(rect => {
         drawPolygon(rect.points, rect.color, false);
-        drawPolygonAreaLabel(rect.points, rect.color);
+        if (rect.showArea !== false) {
+          drawPolygonAreaLabel(rect.points, rect.color);
+        }
       });
 
       // Draw text objects
@@ -670,7 +785,9 @@
       polygons.forEach((poly, index) => {
         const li = document.createElement('li');
         li.className = "object-item";
-        li.innerHTML = `Polygon ${index+1} - Color: <input type="color" value="${poly.color}" data-type="polygon" data-index="${index}"> 
+        li.id = `polygon-${index}`;
+        li.innerHTML = `Polygon ${index+1} - Color: <input type="color" value="${poly.color}" data-type="polygon" data-index="${index}">
+                        Show area <input type="checkbox" data-type="polygon-show" data-index="${index}" ${poly.showArea !== false ? 'checked' : ''}>
                         <button data-type="polygon" data-index="${index}">Delete</button>`;
         objectsList.appendChild(li);
       });
@@ -678,7 +795,9 @@
       segments.forEach((seg, index) => {
         const li = document.createElement('li');
         li.className = "object-item";
-        li.innerHTML = `Segment ${index+1} - Color: <input type="color" value="${seg.color}" data-type="segment" data-index="${index}"> 
+        li.id = `segment-${index}`;
+        li.innerHTML = `Segment ${index+1} - Color: <input type="color" value="${seg.color}" data-type="segment" data-index="${index}">
+                        Show length <input type="checkbox" data-type="segment-show" data-index="${index}" ${seg.showLength !== false ? 'checked' : ''}>
                         <button data-type="segment" data-index="${index}">Delete</button>`;
         objectsList.appendChild(li);
       });
@@ -686,7 +805,9 @@
       rectangles.forEach((rect, index) => {
         const li = document.createElement('li');
         li.className = "object-item";
-        li.innerHTML = `Rectangle ${index+1} - Color: <input type="color" value="${rect.color}" data-type="rectangle" data-index="${index}"> 
+        li.id = `rectangle-${index}`;
+        li.innerHTML = `Rectangle ${index+1} - Color: <input type="color" value="${rect.color}" data-type="rectangle" data-index="${index}">
+                        Show area <input type="checkbox" data-type="rectangle-show" data-index="${index}" ${rect.showArea !== false ? 'checked' : ''}>
                         <button data-type="rectangle" data-index="${index}">Delete</button>`;
         objectsList.appendChild(li);
       });
@@ -694,9 +815,10 @@
       texts.forEach((txt, index) => {
         const li = document.createElement('li');
         li.className = "object-item";
-        li.innerHTML = `Text ${index+1} - Content: <input type="text" value="${txt.text}" data-type="text-content" data-index="${index}"> 
-                        Color: <input type="color" value="${txt.color}" data-type="text" data-index="${index}"> 
-                        Font size: <input type="number" value="${txt.fontSize}" data-type="text-size" data-index="${index}" style="width: 50px;"> 
+        li.id = `text-${index}`;
+        li.innerHTML = `Text ${index+1} - Content: <input type="text" value="${txt.text}" data-type="text-content" data-index="${index}">
+                        Color: <input type="color" value="${txt.color}" data-type="text" data-index="${index}">
+                        Font size: <input type="number" value="${txt.fontSize}" data-type="text-size" data-index="${index}" style="width: 50px;">
                         <button data-type="text" data-index="${index}">Delete</button>`;
         objectsList.appendChild(li);
       });
@@ -716,6 +838,24 @@
           } else if (type === "text") {
             texts[idx].color = e.target.value;
           }
+          markDirty();
+          drawAll();
+        });
+      });
+      // Attach listeners for show/hide measurement checkboxes
+      const showInputs = objectsList.querySelectorAll('input[type="checkbox"]');
+      showInputs.forEach(input => {
+        input.addEventListener('change', (e) => {
+          const type = e.target.getAttribute('data-type');
+          const idx = parseInt(e.target.getAttribute('data-index'));
+          if (type === "polygon-show") {
+            polygons[idx].showArea = e.target.checked;
+          } else if (type === "segment-show") {
+            segments[idx].showLength = e.target.checked;
+          } else if (type === "rectangle-show") {
+            rectangles[idx].showArea = e.target.checked;
+          }
+          markDirty();
           drawAll();
         });
       });
@@ -735,6 +875,7 @@
             texts.splice(idx, 1);
           }
           updateObjectsList();
+          markDirty();
           drawAll();
         });
       });
@@ -744,6 +885,7 @@
         input.addEventListener('change', (e) => {
           const idx = parseInt(e.target.getAttribute('data-index'));
           texts[idx].text = e.target.value;
+          markDirty();
           drawAll();
         });
       });
@@ -752,9 +894,25 @@
         input.addEventListener('change', (e) => {
           const idx = parseInt(e.target.getAttribute('data-index'));
           texts[idx].fontSize = parseInt(e.target.value);
+          markDirty();
           drawAll();
         });
       });
+      if (selectedObject) {
+        highlightObject(selectedObject.type, selectedObject.index);
+      }
+    }
+
+    function highlightObject(type, index) {
+      selectedObject = { type, index };
+      objectsList.querySelectorAll('.object-item').forEach(item => item.classList.remove('selected'));
+      const el = document.getElementById(`${type}-${index}`);
+      if (el) {
+        el.classList.add('selected');
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        const input = el.querySelector('input');
+        if (input) input.focus();
+      }
     }
   </script>
 </body>
