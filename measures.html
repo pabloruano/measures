@@ -26,7 +26,7 @@
     .object-item {
       margin-bottom: 5px;
     }
-    /* Highlight selected item from the list when an element on the canvas is double clicked */
+    /* Highlight selected item when an element is chosen with Ctrl+click */
     .object-item.selected {
       background-color: #ffffcc;
     }
@@ -125,8 +125,9 @@
     let rectangles = []; // Each rectangle: { points: [A, B, C, D], color, showArea }
     let texts = []; // Each text: { x, y, text, color, fontSize, fontFamily }
 
-    // Preview point during drawing, selected list item and dirty flag
+    // Preview point during drawing, hovered item, selected list item and dirty flag
     let previewPoint = null;
+    let hoveredObject = null; // {type, index}
     let selectedObject = null; // {type, index}
     let projectDirty = false;
 
@@ -187,6 +188,16 @@
       const rect = canvas.getBoundingClientRect();
       let x = e.clientX - rect.left;
       let y = e.clientY - rect.top;
+
+      if (e.ctrlKey) {
+        if (isScaleSet) {
+          const obj = getObjectAt(x, y);
+          if (obj) {
+            highlightObject(obj.type, obj.index);
+          }
+        }
+        return;
+      }
 
       // If shift is pressed, snap the new point as in mousemove.
       if (e.shiftKey && measurementPoints.length > 0) {
@@ -260,29 +271,28 @@
       displayCurrentMeasurements();
     });
 
-    // When an existing element on the canvas is double-clicked, scroll to its
-    // entry in the objects list so the user can edit its properties.
-    canvas.addEventListener('dblclick', (e) => {
-      if (!isScaleSet) return;
-      const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      const obj = getObjectAt(x, y);
-      if (obj) {
-        highlightObject(obj.type, obj.index);
-      }
-    });
+    // Ctrl+click focuses the clicked object's configuration.
 
     // --- Canvas Mousemove Handler for Preview ---
     canvas.addEventListener('mousemove', (e) => {
       if (!isScaleSet) {
         previewPoint = null;
+        hoveredObject = null;
         drawAll();
         return;
       }
       const rect = canvas.getBoundingClientRect();
       let x = e.clientX - rect.left;
       let y = e.clientY - rect.top;
+
+      if (e.ctrlKey) {
+        hoveredObject = getObjectAt(x, y);
+        previewPoint = null;
+        drawAll();
+        return;
+      } else {
+        hoveredObject = null;
+      }
       
       if (e.shiftKey && measurementPoints.length > 0) {
         const lastPt = measurementPoints[measurementPoints.length - 1];
@@ -511,7 +521,7 @@
   }
 
   // Determine which drawn object (if any) is located at the given canvas
-  // coordinates. Used when the user double clicks the canvas.
+  // coordinates. Used when the user Ctrl+clicks the canvas.
   function getObjectAt(x, y) {
       const pt = {x, y};
       for (let i = polygons.length - 1; i >= 0; i--) {
@@ -649,6 +659,9 @@
         const lastPt = measurementPoints[measurementPoints.length - 1];
         drawSteppedPreviewLine(lastPt, previewPoint, "red");
       }
+      if (hoveredObject) {
+        drawObjectHighlight(hoveredObject);
+      }
     }
 
     function drawPoint(x, y, color = "red") {
@@ -736,6 +749,50 @@
       ctx.font = "14px sans-serif";
       ctx.fillStyle = color;
       ctx.fillText(label, midPoint.x + 5, midPoint.y - 5);
+    }
+
+    function drawObjectHighlight(obj) {
+      if (!obj) return;
+      ctx.save();
+      ctx.strokeStyle = 'orange';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([5, 3]);
+      if (obj.type === 'polygon') {
+        const pts = polygons[obj.index].points;
+        if (pts.length > 1) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        }
+      } else if (obj.type === 'segment') {
+        const pts = segments[obj.index].points;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        ctx.lineTo(pts[1].x, pts[1].y);
+        ctx.stroke();
+      } else if (obj.type === 'rectangle') {
+        const pts = rectangles[obj.index].points;
+        if (pts.length === 4) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        }
+      } else if (obj.type === 'text') {
+        const t = texts[obj.index];
+        ctx.font = `${t.fontSize}px ${t.fontFamily}`;
+        const w = ctx.measureText(t.text).width;
+        const h = t.fontSize;
+        ctx.strokeRect(t.x - 2, t.y - h, w + 4, h + 4);
+      }
+      ctx.restore();
     }
 
     function displayCurrentMeasurements() {
